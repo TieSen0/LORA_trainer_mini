@@ -1,0 +1,23 @@
+[project]
+name = "mini-lora-trainer"
+version = "0.1.0"
+description = "A Windows desktop workflow for SDXL LoRA dataset preparation, captioning, training, and checkpoint recovery."
+readme = "README.md"
+authors = [
+    { name = "TieSen0", email = "141747610+TieSen0@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "huggingface-hub>=0.34",
+    "numpy>=2.0",
+    "onnxruntime>=1.20",
+    "pillow>=12.3.0",
+    "pyside6>=6.11.2",
+]
+
+[project.scripts]
+mini-lora-trainer = "mini_lora_trainer:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
