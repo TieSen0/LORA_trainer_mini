@@ -33,6 +33,7 @@ if config.get("save_state"):
     for name in ("model.safetensors", "optimizer.bin", "scheduler.bin", "random_states_0.pkl", "scaler.pt"):
         (state / name).write_bytes(b"TEST STATE ONLY")
     (state / "train_state.json").write_text(json.dumps({"current_step": 1, "current_epoch": 1}), encoding="utf-8")
+    print(f"Random states saved in {state / 'random_states_0.pkl'}", flush=True)
 for step in range(3 - resume_step):
     print(f"steps: {step * 50}%|fixture| {step}/2 [00:00<00:00]", end="\r", flush=True)
     time.sleep(0.02)

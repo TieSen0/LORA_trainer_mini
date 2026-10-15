@@ -4,6 +4,7 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QTextEdit, QVBoxLayout
 
 from src.dataset.validator import ValidationReport, validate_dataset
+from src.ui.design import apply_theme, heading
 
 
 class DatasetReviewWorker(QThread):
@@ -25,6 +26,7 @@ class DatasetReviewWorker(QThread):
 class DatasetReviewDialog(QDialog):
     def __init__(self, folder_path: str, parent=None):
         super().__init__(parent)
+        apply_theme()
         self.setWindowTitle("Dataset Review")
         self.resize(760, 500)
         self.summary = QLabel("Checking dataset...")
@@ -35,6 +37,9 @@ class DatasetReviewDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         self.buttons.setEnabled(False)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+        layout.addLayout(heading("Dataset review", "Check image integrity and caption pairing before training"))
         layout.addWidget(self.summary)
         layout.addWidget(self.details)
         layout.addWidget(self.buttons)

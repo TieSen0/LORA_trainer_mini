@@ -3,16 +3,18 @@
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import Signal, QUrl
+from PySide6.QtCore import Signal, QUrl, Qt
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel,
-    QMessageBox, QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QHeaderView,
+    QMessageBox, QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QMenu, QSplitter,
 )
 
 from src.training.checkpoints import inspect_checkpoint, list_checkpoints
 from src.training.config import load_config
 from src.training.history import compare_runs, list_runs
+from src.training.resume import load_resume_config
+from src.ui.design import apply_theme, heading
 
 
 class RunHistoryDialog(QDialog):
@@ -20,47 +22,71 @@ class RunHistoryDialog(QDialog):
 
     def __init__(self, root, parent=None):
         super().__init__(parent)
+        apply_theme()
         self.setWindowTitle("Training History and Performance Comparison")
         self.resize(950, 700)
         self.root = Path(root) if root else None
         self.runs = []
         self.baseline = None
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+        header = QHBoxLayout()
+        header.addLayout(heading("Training history", "Review runs, compare performance, or continue training"), 1)
+        layout.addLayout(header)
         self.folder_label = QLabel()
+        self.folder_label.setTextFormat(Qt.PlainText)
+        self.folder_label.setWordWrap(True)
+        self.folder_label.setProperty("role", "muted")
         layout.addWidget(self.folder_label)
-        buttons = QHBoxLayout()
         for title, callback in (("Choose Output Folder", self.choose_folder), ("Refresh", self.refresh)):
             button = QPushButton(title)
             button.clicked.connect(callback)
-            buttons.addWidget(button)
-        layout.addLayout(buttons)
+            header.addWidget(button)
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["Run", "Status", "Started (UTC)"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().hide()
         self.table.itemSelectionChanged.connect(self.show_selection)
-        layout.addWidget(self.table)
+        split = QSplitter(Qt.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self.table)
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
-        layout.addWidget(self.details)
+        split.addWidget(self.details)
+        split.setSizes([300, 210])
+        layout.addWidget(split, 1)
         self.checkpoints = QComboBox()
-        layout.addWidget(QLabel("Complete-looking state folders (integrity is verified by the trainer on load):"))
-        layout.addWidget(self.checkpoints)
+        checkpoint_row = QHBoxLayout()
+        checkpoint_row.addWidget(QLabel("Resume checkpoint"))
+        checkpoint_row.addWidget(self.checkpoints, 1)
+        self.checkpoints.setToolTip("Listed states pass file checks. The trainer verifies their contents when loading. Only load states you trust.")
+        layout.addLayout(checkpoint_row)
         actions = QHBoxLayout()
-        for index, (title, callback) in enumerate((
-            ("Open Run Folder", self.open_folder), ("Open Log", self.open_log),
-            ("Load Settings", self.load_selected), ("Prepare Resume", self.prepare_resume),
-            ("Use as Baseline", self.set_baseline), ("Compare to Baseline", self.compare),
-        )):
-            if index == 3:
-                layout.addLayout(actions)
-                actions = QHBoxLayout()
+        self.run_actions = []
+        more = QPushButton("Run actions")
+        menu = QMenu(more)
+        for title, callback in (("Open Run Folder", self.open_folder), ("Open Log", self.open_log),
+                                ("Use as Baseline", self.set_baseline), ("Compare to Baseline", self.compare)):
+            menu.addAction(title, callback)
+        more.setMenu(menu)
+        self.run_actions.append(more)
+        actions.addWidget(more)
+        actions.addStretch()
+        for title, callback in (("Use Settings for New Training", self.load_selected), ("Prepare Resume", self.prepare_resume)):
             button = QPushButton(title)
             button.clicked.connect(callback)
             actions.addWidget(button)
+            self.run_actions.append(button)
+        button.setProperty("role", "primary")
+        self.resume_button = button
         layout.addLayout(actions)
-        note = QLabel("Nothing starts automatically. Resume requires a trusted local training state, not just LoRA weights. Memory measurements are GPU-wide and include other apps; compare quality separately in ComfyUI.")
+        note = QLabel("Choose a run and checkpoint. Prepare Resume restores its original settings and paths; training starts only after your confirmation.")
+        note.setProperty("role", "muted")
         note.setWordWrap(True)
         layout.addWidget(note)
         self.refresh()
@@ -88,8 +114,11 @@ class RunHistoryDialog(QDialog):
             for column, value in enumerate((Path(record["directory"]).name, status, record.get("started_at", "Legacy run"))):
                 self.table.setItem(row, column, QTableWidgetItem(str(value)))
         self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.checkpoints.clear()
         self.details.setPlainText("Select a run. Older runs may not have timing or resume state.")
+        for action in self.run_actions:
+            action.setEnabled(False)
 
     def selected_directory(self):
         row = self.table.currentRow()
@@ -98,6 +127,9 @@ class RunHistoryDialog(QDialog):
     def show_selection(self):
         directory = self.selected_directory()
         self.checkpoints.clear()
+        for action in self.run_actions:
+            action.setEnabled(directory is not None)
+        self.resume_button.setEnabled(False)
         if directory is None:
             return
         record = self.runs[self.table.currentRow()]
@@ -106,6 +138,7 @@ class RunHistoryDialog(QDialog):
             for state in states:
                 info = inspect_checkpoint(state)
                 self.checkpoints.addItem(f"{state.name} — saved step {info['current_step']}", str(state))
+            self.resume_button.setEnabled(bool(states))
             models = [p.name for p in directory.glob("*.safetensors") if p.is_file()]
             metrics = record.get("metrics", {})
             self.details.setPlainText(
@@ -116,6 +149,8 @@ class RunHistoryDialog(QDialog):
                 f"\nResumed from: {record.get('resume_from') or 'Fresh run'}"
             )
         except (OSError, ValueError) as error:
+            self.checkpoints.clear()
+            self.resume_button.setEnabled(False)
             self.details.setPlainText(str(error))
 
     def open_folder(self):
@@ -137,7 +172,7 @@ class RunHistoryDialog(QDialog):
             state = self.checkpoints.currentData() if resume else ""
             if resume and not state:
                 raise ValueError("No usable state folder. Old LoRA files alone cannot restore optimizer/scheduler state.")
-            config = replace(config, resume_state=state or "")
+            config = load_resume_config(state) if resume else replace(config, resume_state="")
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, "Cannot Load Run", str(error))
             return

@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PIL import Image
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from src.training.config import SDXLTrainConfig, load_config, save_config, validate_config, validate_settings
+from src.training.config import SCHEMA_VERSION, SDXLTrainConfig, config_payload, load_config, parse_config, save_config, validate_config, validate_settings
 from src.ui.tagging_window import TaggingWindow
 from src.ui.training_dialog import TrainingDialog
 
@@ -58,9 +58,42 @@ class TrainingConfigTests(unittest.TestCase):
             {"output_name": "CON"}, {"output_name": "lora."},
             {"output_name": "lora.safetensors"},
             {"attention_backend": "unknown"},
+            {"cache_latents_to_disk": "yes"},
+            {"cache_latents": False, "cache_latents_to_disk": True},
         ):
             with self.subTest(changes=changes):
                 self.assertTrue(validate_settings(replace(self.config, **changes)))
+
+    def test_disk_latent_cache_roundtrip_and_ui_dependency(self):
+        dialog = TrainingDialog()
+        self.addCleanup(dialog.close)
+        config = replace(self.config, cache_latents_to_disk=True)
+        dialog.apply_config(config)
+        self.assertEqual(dialog.read_config(), config)
+        destination = self.root / "disk-cache.json"
+        save_config(dialog.read_config(), destination)
+        self.assertEqual(load_config(destination), config)
+        dialog.controls["cache_latents"].setChecked(False)
+        self.assertFalse(dialog.controls["cache_latents_to_disk"].isChecked())
+        self.assertFalse(dialog.controls["cache_latents_to_disk"].isEnabled())
+        dialog.controls["cache_latents"].setChecked(True)
+        self.assertTrue(dialog.controls["cache_latents_to_disk"].isEnabled())
+        self.assertFalse(dialog.controls["cache_latents_to_disk"].isChecked())
+
+    def test_legacy_disk_cache_default_and_current_schema_strictness(self):
+        payload = config_payload(self.config)
+        del payload["settings"]["cache_latents_to_disk"]
+        for version in range(1, SCHEMA_VERSION):
+            payload["schema_version"] = version
+            self.assertFalse(parse_config(payload).cache_latents_to_disk)
+        payload["schema_version"] = SCHEMA_VERSION
+        with self.assertRaises(ValueError):
+            parse_config(payload)
+
+    def test_disk_cache_requires_writable_dataset(self):
+        with patch("src.training.config.os.access", return_value=False):
+            errors = validate_config(replace(self.config, cache_latents_to_disk=True))
+        self.assertIn("writable dataset folder", " ".join(errors))
 
     def test_bad_paths_and_existing_model_output_is_preserved_by_separate_runs(self):
         self.assertFalse(validate_config(self.config))
@@ -142,7 +175,7 @@ class TrainingConfigTests(unittest.TestCase):
                 destination = self.root / "attention.json"
                 save_config(dialog.read_config(), destination)
                 self.assertEqual(load_config(destination), config)
-                self.assertEqual(json.loads(destination.read_text())["schema_version"], 6)
+                self.assertEqual(json.loads(destination.read_text())["schema_version"], SCHEMA_VERSION)
         dialog.close()
 
     def test_legacy_attention_default_and_required_new_field(self):

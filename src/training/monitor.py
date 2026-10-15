@@ -99,6 +99,6 @@ def sample_gpu():
         if result.returncode == 0:
             row = next(csv.reader(result.stdout.splitlines()))
             return {"name": row[0].strip(), "memory_mib": float(row[1]), "utilization": float(row[2])}
-    except (OSError, ValueError, StopIteration, subprocess.TimeoutExpired):
+    except (OSError, ValueError, IndexError, StopIteration, subprocess.TimeoutExpired):
         pass
     return None

@@ -52,7 +52,8 @@ for overall in range(initial + 1, total + 1):
         (state / "train_state.json").write_text(json.dumps({
             "current_epoch": math.ceil(overall / batches), "current_step": raw_step,
         }), encoding="utf-8")
-        print("\nTEST CHECKPOINT COMPLETE", flush=True)
+        print(f"\nRandom states saved in {state / 'random_states_0.pkl'}", flush=True)
+        print("TEST CHECKPOINT COMPLETE", flush=True)
         if stop_at < total:
             time.sleep(60)  # The test's owning runner stops this process tree.
             raise RuntimeError("Test runner did not stop at the checkpoint")

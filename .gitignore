@@ -27,6 +27,8 @@ datasets/
 *.pkl
 *.pickle
 *.bin
+*.npz
+diagnostics/
 
 # Local editor settings and secrets
 .idea/

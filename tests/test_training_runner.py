@@ -88,6 +88,17 @@ class TrainingRunnerTests(unittest.TestCase):
                     self.assertTrue(result.model_path.exists())
                     self.assertIn((2, 2), progress)
 
+    def test_disk_cache_export_mapping_without_generating_cache_files(self):
+        for enabled in (False, True):
+            config = replace(self.config, cache_latents_to_disk=enabled)
+            run = create_training_run(config)
+            training = tomllib.loads((run.directory / "training.toml").read_text(encoding="utf-8"))
+            self.assertEqual(training["cache_latents_to_disk"], enabled)
+            self.assertTrue(training["cache_latents"])
+            self.assertNotIn("skip_cache_check", training)
+            self.assertEqual(load_config(run.directory / "settings.json"), config)
+            self.assertEqual(list(self.root.glob("*.npz")), [])
+
     def test_no_process_for_export_and_bad_dataset(self):
         for valid in (True, False):
             if not valid:

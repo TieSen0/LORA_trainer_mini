@@ -69,6 +69,10 @@ def inspect_checkpoint(path: Path) -> dict:
     if settings_path.is_file():
         from src.training.config import load_config
         source = load_config(settings_path)
+        if source.mixed_precision == "fp16" and (
+            not (path / "scaler.pt").is_file() or not (path / "scaler.pt").stat().st_size
+        ):
+            raise ValueError("FP16 resume state is missing or has an empty scaler.pt.")
         if source.resume_state:
             # sd-scripts can save a step relative to the last skipped epoch, but
             # current_epoch remains absolute. Whole-epoch offsets do not change

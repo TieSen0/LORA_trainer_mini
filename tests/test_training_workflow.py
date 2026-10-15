@@ -13,7 +13,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from src.training.checkpoints import dataset_signature, inspect_checkpoint, list_checkpoints, validate_resume
 from src.training.command_builder import create_training_run, training_toml
@@ -22,6 +22,7 @@ from src.training.history import compare_runs, list_runs
 from src.training.monitor import TrainingMonitor, sample_gpu
 from src.training.records import load_session, write_json
 from src.training.runner import TrainingWorker, run_process
+from src.training.resume import load_resume_config, load_resume_from_folder
 from src.ui.run_history_dialog import RunHistoryDialog
 from src.ui.tagging_window import TaggingWindow
 from src.ui.training_dialog import TrainingDialog
@@ -95,6 +96,181 @@ class TrainingWorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             inspect_checkpoint(state)
         self.assertTrue(validate_resume(config))
+
+    def test_disk_cache_resume_keeps_original_choice_and_migrates_legacy_runs(self):
+        for enabled in (False, True):
+            config = replace(self.config, cache_latents_to_disk=enabled)
+            run = create_training_run(config)
+            state = self.make_state(run.directory)
+            resumed = replace(config, resume_state=str(state))
+            self.assertEqual(validate_resume(resumed), [])
+            self.assertIn("cache_latents_to_disk", " ".join(validate_resume(
+                replace(resumed, cache_latents_to_disk=not enabled))))
+            if not enabled:
+                payload = config_payload(config)
+                payload["schema_version"] = 6
+                del payload["settings"]["cache_latents_to_disk"]
+                write_json(run.directory / "settings.json", payload)
+                self.assertEqual(validate_resume(resumed), [])
+
+    def test_manual_resume_restores_all_settings_and_new_training_restores_draft(self):
+        source = replace(self.config, output_name="selected_lora", epochs=20, network_dim=16,
+                         cache_latents_to_disk=True, offline_mode=True)
+        run = create_training_run(source)
+        state = self.make_state(run.directory)
+        write_json(run.directory / "run.json", {"metrics": {"total": 20}})
+        dialog = TrainingDialog()
+        self.addCleanup(dialog.close)
+        draft = replace(self.config, output_name="new_lora_draft", epochs=15)
+        dialog.apply_config(draft)
+        with (patch.object(QFileDialog, "getExistingDirectory", return_value=str(state)),
+              patch("src.ui.training_dialog.TrainingWorker") as worker):
+            dialog.browse_path("resume_state")
+            worker.assert_not_called()
+        self.assertEqual(dialog.read_config(), replace(source, resume_state=str(state)))
+        self.assertEqual(dialog.start_button.text(), "Resume Training")
+        self.assertIn("Saved step 1 / 20", dialog.mode_label.text())
+        self.assertIn("Remaining steps: 19", dialog.mode_label.text())
+        self.assertTrue(dialog.controls["resume_state"].isReadOnly())
+        dialog.start_new_training()
+        self.assertEqual(dialog.read_config(), draft)
+        self.assertEqual(dialog.start_button.text(), "Start Training")
+
+    def test_run_folder_picker_selects_latest_complete_state_only_in_selected_run(self):
+        source = replace(self.config, output_name="chosen_lora", epochs=20)
+        run = create_training_run(source)
+        older = self.make_state(run.directory)
+        newer = run.directory / "chosen_lora-step00000002-state"
+        newer.mkdir()
+        for file in older.iterdir():
+            (newer / file.name).write_bytes(file.read_bytes())
+        write_json(newer / "train_state.json", {"current_step": 2, "current_epoch": 2})
+        # A copied old state may have a newer timestamp; order by saved progress.
+        os.utime(older, (2000000000, 2000000000))
+        incomplete = run.directory / "chosen_lora-step00000003-state"
+        incomplete.mkdir()
+        write_json(incomplete / "train_state.json", {"current_step": 3, "current_epoch": 3})
+        other = create_training_run(replace(self.config, output_name="unrelated_lora"))
+        other_state = self.make_state(other.directory)
+        write_json(other_state / "train_state.json", {"current_step": 9, "current_epoch": 9})
+        dialog = TrainingDialog()
+        self.addCleanup(dialog.close)
+        with (patch.object(QFileDialog, "getExistingDirectory", return_value=str(run.directory)),
+              patch("src.ui.training_dialog.TrainingWorker") as worker):
+            dialog.browse_path("resume_state")
+            worker.assert_not_called()
+        self.assertEqual(dialog.read_config(), replace(source, resume_state=str(newer)))
+        self.assertEqual(dialog.start_button.text(), "Resume Training")
+        self.assertIsNone(dialog.worker)
+
+    def test_quick_resume_does_not_rewind_completed_run_or_checkpoint(self):
+        run = create_training_run(self.config)
+        older = self.make_state(run.directory)
+        newer = run.directory / "my_lora-step00000002-state"
+        newer.mkdir()
+        for file in older.iterdir():
+            (newer / file.name).write_bytes(file.read_bytes())
+        write_json(newer / "train_state.json", {"current_step": 2, "current_epoch": 2})
+        write_json(run.directory / "run.json", {"metrics": {"total": 2}, "status": "stopped"})
+        with self.assertRaisesRegex(ValueError, "reached"):
+            load_resume_from_folder(run.directory)
+        write_json(run.directory / "run.json", {"metrics": {"total": 10}, "status": "success"})
+        with self.assertRaisesRegex(ValueError, "already complete"):
+            load_resume_from_folder(run.directory)
+
+    def test_quick_resume_no_states_or_wrong_folder_preserves_draft(self):
+        run = create_training_run(self.config)
+        dialog = TrainingDialog()
+        self.addCleanup(dialog.close)
+        dialog.apply_config(self.config)
+        with patch.object(QMessageBox, "warning") as warning:
+            dialog.prepare_resume_from_folder(run.directory)
+            self.assertIn("no complete saved state", warning.call_args.args[2])
+            dialog.prepare_resume_from_folder(self.output)
+            self.assertIn("one LoRA run folder", warning.call_args.args[2])
+        self.assertEqual(dialog.read_config(), self.config)
+        self.assertIsNone(dialog.worker)
+
+    def test_quick_resume_orders_resumed_states_by_overall_not_raw_step(self):
+        run = create_training_run(self.config)
+        later = self.make_state(run.directory)
+        earlier = run.directory / "my_lora-step00000002-state"
+        earlier.mkdir()
+        for file in later.iterdir():
+            (earlier / file.name).write_bytes(file.read_bytes())
+        source = replace(self.config, resume_state=str(self.root / "missing-ancestor-state"))
+        save_config(source, run.directory / "settings.json")
+        write_json(run.directory / "run.json", {"step_layout": {"version": 1, "steps_per_epoch": 2}})
+        write_json(later / "train_state.json", {"current_step": 1, "current_epoch": 3})
+        write_json(earlier / "train_state.json", {"current_step": 2, "current_epoch": 2})
+        self.assertEqual(load_resume_from_folder(run.directory).resume_state, str(later))
+
+    def test_history_can_resume_older_selected_state_and_copy_settings_for_new_run(self):
+        run = create_training_run(self.config)
+        older = self.make_state(run.directory)
+        newer = run.directory / "my_lora-step00000002-state"
+        newer.mkdir()
+        for file in older.iterdir():
+            (newer / file.name).write_bytes(file.read_bytes())
+        write_json(newer / "train_state.json", {"current_step": 2, "current_epoch": 2})
+        write_json(run.directory / "run.json", {"status": "stopped", "metrics": {"total": 10}})
+        history = RunHistoryDialog(self.output)
+        self.addCleanup(history.close)
+        history.table.selectRow(0)
+        self.assertEqual(history.checkpoints.currentData(), str(newer))
+        history.checkpoints.setCurrentIndex(history.checkpoints.findData(str(older)))
+        selected = []
+        history.settings_selected.connect(selected.append)
+        history.prepare_resume()
+        self.assertEqual(selected[-1], replace(self.config, resume_state=str(older)))
+        history.load_selected()
+        self.assertEqual(selected[-1], self.config)
+
+    def test_invalid_or_completed_resume_does_not_replace_new_training_draft(self):
+        run = create_training_run(self.config)
+        state = self.make_state(run.directory)
+        write_json(run.directory / "run.json", {"metrics": {"total": 1}})
+        dialog = TrainingDialog()
+        self.addCleanup(dialog.close)
+        dialog.apply_config(self.config)
+        with patch.object(QMessageBox, "warning") as warning:
+            dialog.prepare_resume_from_path(state)
+            self.assertIn("reached", warning.call_args.args[2])
+            dialog.prepare_resume_from_path(self.root / "missing-state")
+        self.assertEqual(dialog.read_config(), self.config)
+        self.assertIsNone(dialog.worker)
+        self.assertEqual(dialog.start_button.text(), "Start Training")
+
+    def test_reopening_setup_keeps_resume_settings_but_new_dataset_clears_selection(self):
+        run = create_training_run(self.config)
+        state = self.make_state(run.directory)
+        window = TaggingWindow(str(self.dataset))
+        self.addCleanup(window.close)
+        with patch.object(TrainingDialog, "exec", return_value=0):
+            window.open_training_setup()
+            window.training_dialog.prepare_resume_from_path(state)
+            window.set_caption_prefix("different_draft_prefix", "1girl")
+            window.open_training_setup()
+            self.assertEqual(window.training_dialog.read_config(), replace(self.config, resume_state=str(state)))
+            other = self.root / "new-dataset"
+            other.mkdir()
+            Image.new("RGB", (16, 16)).save(other / "new.png")
+            window.open_dataset(str(other))
+            window.open_training_setup()
+        self.assertEqual(window.training_dialog.read_config().resume_state, "")
+        self.assertEqual(window.training_dialog.read_config().dataset_path, str(other))
+        self.assertEqual(window.training_dialog.start_button.text(), "Start Training")
+
+    def test_resume_preparation_needs_no_ancestor_state(self):
+        run = create_training_run(self.config)
+        state = self.make_state(run.directory)
+        source = replace(self.config, resume_state=str(self.root / "deleted-ancestor-state"))
+        save_config(source, run.directory / "settings.json")
+        write_json(state / "train_state.json", {"current_step": 1, "current_epoch": 3})
+        write_json(run.directory / "run.json", {"step_layout": {"version": 1, "steps_per_epoch": 2}})
+        config = load_resume_config(state)
+        self.assertEqual(config, replace(source, resume_state=str(state)))
+        self.assertEqual(inspect_checkpoint(state)["current_step"], 5)
 
     def test_checkpoint_options_default_migration_and_ranges(self):
         self.assertTrue(self.config.save_training_state)
@@ -181,6 +357,30 @@ class TrainingWorkflowTests(unittest.TestCase):
                 write_json(path, {"original": False})
         self.assertEqual(json.loads(path.read_text()), {"original": True})
         self.assertEqual(list(self.root.glob(".record-*")), [])
+
+    def test_stop_during_unconfirmed_save_does_not_claim_recovery_point(self):
+        worker = TrainingWorker(self.config)
+        results = []
+        worker.completed.connect(results.append)
+
+        def interrupted_save(command, cwd, output, stop_requested, **kwargs):
+            if command[2] == "-c":
+                return 0
+            run_dir = Path(command[-1]).parent
+            # Files are nonempty but the trainer has not confirmed save completion
+            # or advanced beyond this step. Forced stop must not bless this state.
+            self.make_state(run_dir)
+            output("total optimization steps: 2\nsteps: 50%|x| 1/2\r")
+            worker.request_stop()
+            return -1
+
+        with patch("src.training.runner.run_process", side_effect=interrupted_save):
+            worker.run()
+        self.assertEqual(results[0].status, "stopped")
+        record = json.loads((results[0].run_directory / "run.json").read_text())
+        self.assertIsNone(record["checkpoint_status"]["latest"])
+        self.assertEqual(record["checkpoint_status"]["pending_count"], 1)
+        self.assertEqual(record["checkpoint_status"]["steps_at_risk"], 1)
 
     def test_stopped_resume_records_overall_steps_without_changing_source(self):
         source = create_training_run(self.config)

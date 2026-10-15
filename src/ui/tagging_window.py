@@ -2,7 +2,7 @@ from pathlib import Path
 from dataclasses import replace
 
 from PySide6.QtCore import QSignalBlocker, Qt, QTimer
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -16,6 +16,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSlider,
+    QSplitter,
+    QTabWidget,
+    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -36,11 +39,13 @@ from src.ui.dataset_review_dialog import DatasetReviewDialog
 from src.ui.training_dialog import TrainingDialog
 from src.training.config import config_payload, parse_config
 from src.training.records import load_session, write_json
+from src.ui.design import apply_theme, heading, label, ImagePreview
 
 
 class TaggingWindow(QWidget):
     def __init__(self, folder_path: str | None = None, *, session_path: Path | None = None):
         super().__init__()
+        apply_theme()
 
         self.folder_path = ""
         self.images = []
@@ -50,15 +55,23 @@ class TaggingWindow(QWidget):
         self.session_path = session_path
         self.remembered_training = None
         self.restoring_session = False
+        self.preview_paused = False
+        self.release_preview_on_training = True
 
-        self.setWindowTitle("Mini LoRA Tagger")
-        self.resize(1000, 700)
+        self.setWindowTitle("Mini LoRA Trainer")
+        self.resize(1120, 780)
 
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(600, 500)
+        self.image_label = ImagePreview()
+        self.filename_label = label("Image preview", "section")
+        self.preview_memory_button = QPushButton("Release Preview Memory")
+        self.preview_memory_button.setToolTip("Unload the preview without changing images or captions. Navigation remains available.")
+        self.preview_memory_button.clicked.connect(self.toggle_preview)
 
         self.caption_edit = QTextEdit()
+        self.caption_edit.setAcceptRichText(False)
+        self.caption_edit.setPlaceholderText("Write a caption, or generate tags with WD14 below.")
+        self.caption_edit.setMinimumHeight(130)
+        self.caption_edit.setAccessibleName("Image caption")
 
         self.choose_folder_button = QPushButton("Choose Dataset Folder")
         self.choose_folder_button.clicked.connect(self.choose_dataset_folder)
@@ -71,6 +84,7 @@ class TaggingWindow(QWidget):
         self.next_button = QPushButton("Next")
         self.position_label = QLabel()
         self.position_slider = QSlider(Qt.Horizontal)
+        self.position_slider.setAccessibleName("Image position")
         self.position_slider.setRange(0, max(0, len(self.images) - 1))
         self.position_slider.setEnabled(bool(self.images))
 
@@ -88,6 +102,7 @@ class TaggingWindow(QWidget):
         self.rename_button = QPushButton("Batch Rename Dataset")
         self.review_button = QPushButton("Review Dataset")
         self.training_button = QPushButton("Training Setup")
+        self.training_button.setProperty("role", "primary")
         self.training_dialog = None
         self.training_dataset_path = None
         self.dataset_status = QLabel()
@@ -128,49 +143,91 @@ class TaggingWindow(QWidget):
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.previous_button)
-        button_layout.addWidget(self.save_button)
+        button_layout.addWidget(self.position_slider, 1)
+        button_layout.addWidget(self.position_label)
         button_layout.addWidget(self.next_button)
 
         prefix_layout = QHBoxLayout()
         prefix_layout.addWidget(self.apply_prefix_current_button)
         prefix_layout.addWidget(self.apply_prefix_all_button)
         prefix_form = QFormLayout()
+        prefix_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        prefix_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         prefix_form.addRow("Trigger Word:", self.trigger_word_edit)
         prefix_form.addRow("Class Token:", self.class_token_edit)
-        prefix_form.addRow("Caption Prefix Preview:", self.prefix_preview)
+        prefix_form.addRow("Prefix preview:", self.prefix_preview)
         prefix_form.addRow(prefix_layout)
 
         tagger_layout = QFormLayout()
+        tagger_layout.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        tagger_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         tagger_layout.addRow("WD14 threshold:", self.wd14_threshold)
         tagger_layout.addRow("Exclude tags:", self.wd14_excluded_tags)
         tagger_buttons = QHBoxLayout()
         tagger_buttons.addWidget(self.tag_current_button)
         tagger_buttons.addWidget(self.tag_all_button)
 
-        right_layout = QVBoxLayout()
-        right_layout.addWidget(self.caption_edit)
-        right_layout.addLayout(prefix_form)
-        right_layout.addLayout(tagger_layout)
-        right_layout.addLayout(tagger_buttons)
-        right_layout.addWidget(self.tagging_status)
-        right_layout.addWidget(self.position_label)
-        right_layout.addWidget(self.position_slider)
-        right_layout.addLayout(button_layout)
-        right_layout.addWidget(self.rename_button)
-        right_layout.addWidget(self.dataset_status)
+        self.caption_tools = QTabWidget()
+        prefix_page, tagger_page = QWidget(), QWidget()
+        prefix_page_layout = QVBoxLayout(prefix_page)
+        prefix_page_layout.addLayout(prefix_form)
+        prefix_page_layout.addWidget(label("Adds prefix tags without replacing your caption."))
+        prefix_page_layout.addStretch()
+        tagger_page_layout = QVBoxLayout(tagger_page)
+        tagger_page_layout.addLayout(tagger_layout)
+        tagger_page_layout.addLayout(tagger_buttons)
+        tagger_page_layout.addWidget(self.tagging_status)
+        tagger_page_layout.addWidget(label("WD14 replaces captions. Review the generated tags."))
+        tagger_page_layout.addStretch()
+        self.caption_tools.addTab(prefix_page, "Caption prefix")
+        self.caption_tools.addTab(tagger_page, "Auto-tag · WD14")
 
-        main_layout = QHBoxLayout()
-        main_layout.addWidget(self.image_label, 2)
-        main_layout.addLayout(right_layout, 1)
+        inspector = QWidget()
+        right_layout = QVBoxLayout(inspector)
+        right_layout.setContentsMargins(12, 0, 0, 0)
+        caption_header = QHBoxLayout()
+        caption_header.addWidget(label("Caption", "section"))
+        caption_header.addStretch()
+        caption_header.addWidget(self.save_button)
+        right_layout.addLayout(caption_header)
+        right_layout.addWidget(self.caption_edit, 1)
+        right_layout.addWidget(label("Changes are saved when you move to another image."))
+        right_layout.addWidget(self.caption_tools)
+        inspector_scroll = QScrollArea()
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setWidget(inspector)
+        inspector_scroll.setMinimumWidth(360)
+
+        preview = QWidget()
+        preview_layout = QVBoxLayout(preview)
+        preview_layout.setContentsMargins(0, 0, 12, 0)
+        preview_header = QHBoxLayout()
+        preview_header.addWidget(self.filename_label, 1)
+        preview_header.addWidget(self.preview_memory_button)
+        preview_layout.addLayout(preview_header)
+        preview_layout.addWidget(self.image_label, 1)
+        preview_layout.addLayout(button_layout)
+        self.workspace_splitter = QSplitter(Qt.Horizontal)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.addWidget(preview)
+        self.workspace_splitter.addWidget(inspector_scroll)
+        self.workspace_splitter.setSizes([660, 440])
 
         folder_layout = QHBoxLayout()
         folder_layout.addWidget(self.choose_folder_button)
         folder_layout.addWidget(self.dataset_path_edit, 1)
         folder_layout.addWidget(self.review_button)
-        folder_layout.addWidget(self.training_button)
+        folder_layout.addWidget(self.rename_button)
         window_layout = QVBoxLayout()
+        window_layout.setContentsMargins(24, 20, 24, 16)
+        window_layout.setSpacing(16)
+        header = QHBoxLayout()
+        header.addLayout(heading("Mini LoRA Trainer", "Dataset workspace  /  Prepare images and captions"), 1)
+        header.addWidget(self.training_button)
+        window_layout.addLayout(header)
         window_layout.addLayout(folder_layout)
-        window_layout.addLayout(main_layout)
+        window_layout.addWidget(self.workspace_splitter, 1)
+        window_layout.addWidget(self.dataset_status)
         self.setLayout(window_layout)
 
         self.position_label.setText("0 / 0")
@@ -202,6 +259,10 @@ class TaggingWindow(QWidget):
                 "training": config_payload(config) if config else None,
                 "wd14_threshold": self.wd14_threshold.value(),
                 "wd14_excluded_tags": self.wd14_excluded_tags.text(),
+                "release_preview_on_training": (
+                    self.training_dialog.release_preview_checkbox.isChecked()
+                    if self.training_dialog else self.release_preview_on_training
+                ),
             })
         except (OSError, ValueError) as error:
             self.dataset_status.setText(f"Could not remember settings: {error}. Save a training settings copy manually.")
@@ -210,6 +271,10 @@ class TaggingWindow(QWidget):
         self.restoring_session = True
         try:
             data = load_session(self.session_path)
+            release_preview = data.get("release_preview_on_training", True)
+            if type(release_preview) is not bool:
+                raise ValueError("Invalid remembered preview-memory preference.")
+            self.release_preview_on_training = release_preview
             if data.get("training") is not None:
                 # Resume must always be an explicit action after reopening the app.
                 self.remembered_training = replace(parse_config(data["training"]), resume_state="")
@@ -299,20 +364,14 @@ class TaggingWindow(QWidget):
             )
             self.caption_edit.clear()
             self.position_label.setText("0 / 0")
-            self.setWindowTitle("Mini LoRA Tagger")
+            self.filename_label.setText("Image preview")
+            self.setWindowTitle("Mini LoRA Trainer")
 
     def load_current_image(self, caption: str | None = None):
         image_path = self.images[self.index]
 
-        pixmap = QPixmap(str(image_path))
-
-        pixmap = pixmap.scaled(
-            self.image_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-
-        self.image_label.setPixmap(pixmap)
+        self.refresh_preview()
+        self.filename_label.setText(image_path.name)
 
         if caption is None:
             caption = load_caption(image_path)
@@ -326,8 +385,37 @@ class TaggingWindow(QWidget):
         self.position_label.setText(f"{self.index + 1} / {len(self.images)}")
 
         self.setWindowTitle(
-            f"Mini LoRA Tagger - {self.index + 1}/{len(self.images)}"
+            f"Mini LoRA Trainer - {self.index + 1}/{len(self.images)}"
         )
+
+    def refresh_preview(self):
+        """Update only image pixels, never reload the caption editor."""
+        if self.preview_paused:
+            self.image_label.clear()
+            self.image_label.setText("Preview paused to save memory.\nClick Load Preview to view the selected image.")
+        elif self.images:
+            # QPixmap(path) implicitly caches file-loaded pixmaps on the GUI
+            # thread. Decode via QImageReader so clearing our two pixmaps really
+            # drops all preview-owned pixel references, without flushing UI icons.
+            reader = QImageReader(str(self.images[self.index]))
+            self.image_label.set_source(QPixmap.fromImage(reader.read()))
+
+    def release_preview_memory(self):
+        if not self.images:
+            return
+        self.preview_paused = True
+        self.preview_memory_button.setText("Load Preview")
+        self.refresh_preview()
+
+    def toggle_preview(self):
+        if not self.images or self.tagging_worker is not None:
+            return
+        if self.preview_paused:
+            self.preview_paused = False
+            self.preview_memory_button.setText("Release Preview Memory")
+            self.refresh_preview()
+        else:
+            self.release_preview_memory()
 
     def save_current_caption(self):
         if not self.images:
@@ -546,13 +634,18 @@ class TaggingWindow(QWidget):
             return
         if self.training_dialog is None:
             self.training_dialog = TrainingDialog(self)
+            self.training_dialog.release_preview_checkbox.setChecked(self.release_preview_on_training)
+            self.training_dialog.release_preview_requested.connect(self.release_preview_memory)
             if self.remembered_training is not None:
                 self.training_dialog.apply_config(self.remembered_training)
             self.training_dialog.settings_changed.connect(self.schedule_session_save)
         if self.folder_path and self.folder_path != self.training_dataset_path:
+            if self.training_dialog.read_config().resume_state:
+                self.training_dialog.start_new_training()
             self.training_dialog.controls["dataset_path"].setText(self.folder_path)
             self.training_dataset_path = self.folder_path
-        if self.folder_path and self.dataset_key(self.training_dialog.read_config().dataset_path) == self.dataset_key(self.folder_path):
+        if (self.folder_path and not self.training_dialog.read_config().resume_state
+                and self.dataset_key(self.training_dialog.read_config().dataset_path) == self.dataset_key(self.folder_path)):
             self.training_dialog.set_caption_prefix(self.trigger_word_edit.text(), self.class_token_edit.text())
         self.training_dialog.exec()
         config = self.training_dialog.read_config()
@@ -649,6 +742,7 @@ class TaggingWindow(QWidget):
         for widget in (
             self.caption_edit, self.previous_button, self.next_button,
             self.save_button, self.position_slider, self.trigger_word_edit, self.class_token_edit,
+            self.preview_memory_button,
             self.apply_prefix_current_button, self.apply_prefix_all_button,
             self.rename_button, self.wd14_threshold, self.wd14_excluded_tags,
             self.tag_current_button, self.tag_all_button,

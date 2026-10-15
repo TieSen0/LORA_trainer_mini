@@ -15,7 +15,7 @@ OPTIMIZERS = ("AdamW", "AdamW8bit")
 SCHEDULERS = ("constant", "cosine", "linear")
 PRECISIONS = ("fp16", "bf16", "no")
 ATTENTION_BACKENDS = ("sdpa", "xformers")
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,7 @@ class SDXLTrainConfig:
     mixed_precision: str = "fp16"
     attention_backend: str = "sdpa"
     cache_latents: bool = True
+    cache_latents_to_disk: bool = False
     cache_text_encoder_outputs: bool = False
     gradient_checkpointing: bool = True
     network_train_unet_only: bool = True
@@ -100,6 +101,8 @@ def validate_settings(config: SDXLTrainConfig) -> list[str]:
         errors.append("Caching text-encoder outputs requires U-Net-only training.")
     if config.cache_text_encoder_outputs and config.shuffle_caption:
         errors.append("Shuffle Captions cannot be enabled while caching text-encoder outputs.")
+    if config.cache_latents_to_disk and not config.cache_latents:
+        errors.append("Cache latents to disk requires Cache latents to be enabled.")
 
     name = config.output_name
     if (
@@ -137,6 +140,8 @@ def validate_config(config: SDXLTrainConfig) -> list[str]:
             errors.append("Choose a dataset folder.")
         elif not scan_images(config.dataset_path):
             errors.append("The dataset folder contains no supported images directly inside it.")
+        elif config.cache_latents_to_disk and not os.access(config.dataset_path, os.W_OK):
+            errors.append("Disk latent caching requires a writable dataset folder; cache files are stored beside images.")
     except (OSError, ValueError) as error:
         errors.append(f"Cannot scan the dataset folder: {error}")
     try:
@@ -200,7 +205,7 @@ def load_config(source: Path) -> SDXLTrainConfig:
 
 
 def parse_config(payload) -> SDXLTrainConfig:
-    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload.get("schema_version") not in (1, 2, 3, 4, 5, SCHEMA_VERSION):
+    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload.get("schema_version") not in (1, 2, 3, 4, 5, 6, SCHEMA_VERSION):
         raise ValueError("Unsupported training configuration version.")
     if payload.get("training_type") != "sdxl_lora":
         raise ValueError("Only SDXL LoRA configurations are supported.")
@@ -227,6 +232,9 @@ def parse_config(payload) -> SDXLTrainConfig:
             "save_training_state": False, "save_every_n_steps": 0, "resume_state": "",
             "seed": -1, "measure_performance": False, **settings,
         }
+    if isinstance(settings, dict) and payload["schema_version"] < 7:
+        # Preserve existing in-memory caching and resume compatibility.
+        settings = {"cache_latents_to_disk": False, **settings}
     if not isinstance(settings, dict) or set(settings) != {item.name for item in fields(SDXLTrainConfig)}:
         raise ValueError("The configuration has missing or unknown settings.")
     config = SDXLTrainConfig(**settings)

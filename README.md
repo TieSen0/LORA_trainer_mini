@@ -88,12 +88,16 @@ for other installation methods.
 
 ### 2. Install and launch the desktop app
 
-Run these commands from the repository root:
+After installing uv, double-click **Setup.cmd**, then **Start.cmd**.
+Setup uses the locked desktop dependencies and can download Python 3.12 if needed.
+Start launches the existing environment without updating packages or checking the network.
+
+For command-line use, from the repository root:
 
 ```powershell
 uv python install 3.12
-uv sync --locked
-uv run app.py
+uv sync --locked --inexact
+.venv\Scripts\python.exe app.py
 ```
 
 `uv sync` installs the GUI and captioning dependencies into this project's
@@ -102,7 +106,38 @@ or optional training packages. Initial dependency/model downloads require networ
 access; later training can use [Offline Mode](#offline-mode).
 
 Always run the app from this source checkout. A standalone wheel or executable
-distribution is not currently supported. To launch it again, use `uv run app.py`.
+distribution is not currently supported. To launch it again, use **Start.cmd**.
+
+### Desktop maintenance and diagnostics
+
+| Entry point | Purpose |
+| --- | --- |
+| `Setup.cmd` | Install/synchronize locked desktop packages; also use after updating the source. |
+| `Start.cmd` | Launch without dependency updates. Startup logs go into `diagnostics/`. |
+| `Check.cmd` | Read-only dependency/path checks, using remembered training settings when available; saves a local report. Works even if Qt cannot import. |
+| `Repair.cmd` | Reinstall locked desktop packages. Close the app first. Does not delete models, datasets, outputs, or settings. |
+| Training Setup → Environment → **Check Environment** | Check the settings currently shown, including the selected training interpreter, CUDA and optional training packages. Results can be saved with **Save Report...**. |
+
+Check runs no training, downloads, or repairs. Imports run in separate processes,
+with a 45-second timeout each. It does not load model weights or prove sufficient
+memory, tokenizer availability, or a successful future training run. Reports may
+contain local paths; review them before sharing. Reports/startup logs are local,
+ignored by Git, and may be removed manually when no longer needed.
+
+Start uses windowed Python so the application is visible without leaving a Python
+console open. Immediate startup failures keep the launcher console open with the
+error-log path. If the interface still does not appear, inspect the newest
+`diagnostics/startup-*.error.log` and run **Check.cmd**; avoid repeatedly launching
+extra copies. The short startup check is not a guarantee that initialization has
+finished or that a window will appear.
+
+Setup/Repair target only this project's `.venv`; the prepared **sd-scripts
+environment is separate**. They use `--locked --inexact`: keep the lockfile fixed
+and retain unrelated installed packages unless they conflict with required ones
+([uv sync behavior](https://docs.astral.sh/uv/concepts/projects/sync/)).
+They do not update the project source or install/repair CUDA, PyTorch, or sd-scripts.
+For a training-runtime failure, follow the selected trainer revision's installation
+instructions rather than installing its dependencies into the desktop environment.
 
 ### 3. Prepare local folders and model files
 
@@ -177,6 +212,25 @@ You can type directly into the caption editor and click **Save**, or generate
 tags using WD14. Set a distinctive **Trigger Word**, for example `example_character`,
 and optionally a **Class Token**, such as `1girl`.
 
+The workspace puts the resizable image preview on the left and caption editing
+on the right. Drag the divider to adjust their widths. **Save** stays beside the
+caption editor; image navigation stays below the preview. The **Caption prefix**
+and **Auto-tag · WD14** tabs separate the two caption tools without changing what
+they do. The prefix is still included when generating WD14 captions.
+
+For machines with limited RAM, click **Release Preview Memory** above the image.
+This unloads the original preview and its display copy without changing your
+caption edits or dataset files. While paused, Previous/Next and the slider still
+load captions but do not load images. Click **Load Preview** to show the selected
+image again; resizing or completing training does not reload it automatically.
+
+In **Training Setup → Environment**, **Release preview memory when training
+starts** is enabled by default. It applies to training, not opening setup or
+exporting files. This preference is remembered locally, separate from training
+configurations and resume states. A new app session starts with preview enabled
+for captioning. Releasing preview memory does not unload the trainer or WD14;
+Windows may not immediately report a matching drop in RAM usage.
+
 | Control | What it does |
 | --- | --- |
 | Apply to Current | Adds the prefix to the current editor text, including unsaved edits. It does not run WD14. |
@@ -215,6 +269,19 @@ Open **Training Setup** and select your SDXL base model, dataset, output folder,
 sd-scripts folder, and training Python. Enter `my_character` as the output name,
 without an extension.
 
+Settings are organized into four sections:
+
+| Section | Controls |
+| --- | --- |
+| Training | Model, dataset, output, and core training parameters, including SDPA/xFormers. |
+| Captions | Trigger/Class Token, repeats, Keep Tokens, and caption shuffling. |
+| Recovery | State saving, checkpoint interval, seed, and resume selection. |
+| Environment | sd-scripts, training Python, offline mode, performance measurement, and memory options. |
+
+Each section scrolls when needed. **Check Settings**, **Start Training**, and
+**Stop** remain outside the scrolling area. **Training Log** contains progress,
+the latest recovery point, and the process log.
+
 The editable defaults include:
 
 | Setting | Default |
@@ -227,6 +294,7 @@ The editable defaults include:
 | Precision / attention | fp16 / SDPA |
 | Caption shuffling | Enabled |
 | Latent caching / gradient checkpointing | Enabled |
+| Cache latents to disk | Disabled (opt-in) |
 | Text-encoder output caching | Disabled |
 | Training scope | U-Net only |
 | Seed / resumable-state saving | 42 / enabled for new settings |
@@ -246,11 +314,47 @@ Important relationships:
 - Use a fixed seed for resumable training. Older saved configurations may retain
   random seed behavior and disabled state saving; check them explicitly.
 
+#### Latent caching: RAM versus disk
+
+**Cache latents** stores VAE-encoded image representations for reuse during
+training, in RAM by default. It does not itself select disk storage.
+
+Enable **Training Setup → Environment → Cache latents to disk (reduce RAM use)**
+alongside **Cache latents** to store those representations in `.npz` files beside
+the dataset images. The dataset folder must be writable. Disabling Cache latents
+also clears/disables its disk option. Settings files, remembered drafts, exports,
+and history retain the choice; older settings load with disk caching off.
+
+- The first run generates the cache. Later compatible runs can reuse it, reducing
+  repeated VAE preparation work. Export-only does not create cache files.
+- Switching to a different dataset folder automatically uses that folder's caches
+  or generates missing ones when training starts. You do not have to load a cache
+  manually. Replacing image contents at the same paths is different: an old cache
+  may still pass the trainer's checks, so follow the stale-cache warning below.
+- Disk storage reduces the RAM needed for the latent cache, not the memory needed
+  for the whole model. Disk reads can slow individual training steps; this is not
+  a guaranteed speedup or an additional large VRAM saving over RAM caching.
+- Cache filenames depend on the sd-scripts version; the installed trainer may
+  use dimension-suffixed filenames or legacy `<image-stem>.npz` files.
+- **Stale-cache warning:** trainer checks do not reliably fingerprint image
+  contents or the model/VAE. If those change, move the corresponding generated
+  latent-cache files to a backup folder before the next new run so they regenerate.
+  Rebuild after changing resolution/preprocessing if compatibility is uncertain.
+  Do not remove unrelated `.npz` files. The app never automatically deletes caches.
+- Latents represent images, not captions; caption edits alone do not require
+  regenerating image latents. Existing resume restrictions on dataset changes
+  still apply. These files are not resumable checkpoints.
+- Resume keeps the original disk-cache choice. Try changing storage mode in a
+  new run; do not edit an old run's settings to bypass the compatibility check.
+
+Disk caching remains opt-in so existing workflows do not unexpectedly write to
+dataset folders. Text-encoder disk caching is not included in this option.
+
 ### Step 5 — Validate, export, or train
 
 1. Click **Check Settings** and resolve reported problems.
-2. Use **Save Settings...** to keep a reusable JSON configuration.
-3. Optionally click **Export Training Files** to inspect the generated TOMLs and
+2. Use **Settings & export → Save Settings...** to keep a reusable JSON configuration.
+3. Optionally choose **Settings & export → Export Training Files** to inspect the generated TOMLs and
    command without starting training.
 4. Click **Start Training**. The app reviews the dataset again and checks the
    selected training environment before launching.
@@ -288,16 +392,59 @@ random-state, position, and applicable precision-scaler files.
 - Keep the original dataset, base model, training settings, and fixed seed when
   resuming. **Epochs remains the original total target**, not additional epochs.
 
+The Training Log tab shows the **last complete checkpoint**, its overall step,
+folder, save time (UTC), and the reported steps since that recovery point.
+**Open Checkpoint Folder** opens that exact state directory. After stopping,
+**Prepare Latest Resume** loads its settings and selects it without starting
+training; this action is unavailable for a checkpoint at the completed target.
+A resumed run also shows its selected source checkpoint before a new one exists.
+
+Checkpoint detection requires the expected nonempty files (including the fp16
+scaler when applicable) plus a trainer save-completion message, later training
+progress, or successful trainer exit. A new folder alone is not treated as a
+completed save. These are structural/completion checks, not binary-integrity
+verification. Unsupported log formats may delay confirmation until progress
+advances. Stop asks for confirmation and shows the current recovery information;
+training may advance while the question is open, so the loss count is an estimate.
+
 To continue:
 
-1. Open **History / Compare** and select the latest interrupted run.
-2. Select a complete state folder and click **Prepare Resume**.
-3. Check the settings and click **Start Training**. Only approve states you trust.
-4. If you stop again, repeat these steps using a checkpoint from the new run.
+1. Click **Resume from checkpoint...** in Training Setup (or open **History /
+   Compare**) and select the unfinished run you want—not necessarily the latest run.
+2. Select the desired complete checkpoint and click **Prepare Resume**. The list
+   puts newer states first, but you can choose an older saved state explicitly.
+3. The app loads that checkpoint's original training settings and paths, including
+   the dataset, base model, output location, runtime, and cache options. The header
+   shows the selected run/checkpoint, saved step, and remaining steps when the
+   original total is recorded. Missing totals are not guessed.
+4. Review the settings and click **Resume Training**, then confirm the selected
+   state is trusted. Choosing a checkpoint alone never starts training.
+5. If you stop again, repeat these steps using a checkpoint from the new run.
 
-Alternatively, load the relevant run's settings and browse to its state folder
-under **Resume state folder**. **New Training** clears this field; loading
-settings alone starts nothing and does not restore optimizer state.
+For quick resume, use **Recovery → Choose Run...** and select one LoRA run folder,
+such as `output/my_character-<unique-id>`—not the whole output folder. The app
+selects its latest complete checkpoint by saved overall step and loads that run's
+original settings and paths automatically. It skips structurally incomplete states,
+but will not silently fall back to an older state when the newest complete state is
+incompatible or has reached the target. Successfully completed runs are not quick-
+resumed. No other run is selected, and nothing starts until you confirm Resume Training.
+
+The read-only **Selected checkpoint** field shows the actual state chosen. History
+still lets you deliberately select an older checkpoint. Selecting a specific state
+folder in the Recovery picker remains supported for compatibility. Keep complete
+state folders inside their run folder with the accompanying settings and metadata.
+
+**New Training** in Recovery exits resume mode and restores the new-training draft
+you had before selecting a checkpoint in this dialog. History's **Use Settings for
+New Training** instead copies the selected run's settings with no resume state.
+Starting the app never automatically resumes anything; selecting a different
+dataset in the workspace clears an existing resume selection when opening setup.
+Reopening setup for the same dataset preserves the explicitly selected resume
+and does not overwrite its prefix/Keep Tokens settings from the caption workspace.
+
+The saved settings are loaded, not silently rewritten to fit missing paths or
+incompatible data. The app reports unusable checkpoints and validates again before
+launching. Original run folders are not modified by preparing a resume.
 
 For example, a checkpoint at step `378` of `504` resumes with the next step
 displayed as `379 / 504`. You can later resume from `400`, then `450`, while
@@ -347,13 +494,28 @@ WD14 use, supply both matching model files described above. Exported
   and training draft between launches in
   `%LOCALAPPDATA%/MiniLoRATrainer/session.json`. Resume selection is cleared on
   startup so continuation is always intentional.
-- **Save Settings... / Load Settings...** use application JSON configurations,
+- **Save Settings... / Load Settings...**, in the **Settings & export** menu, use application JSON configurations,
   not arbitrary sd-scripts TOMLs. Each run also stores its exact settings. Older
   supported configuration versions are migrated on load.
 - **History / Compare** lists outcomes, model files, and available state folders;
   opens logs/folders; loads settings; and prepares a resume. **Choose Output
   Folder** changes which runs History lists—it does not select a resume state.
-- **Measure performance** enables optional GPU memory sampling. History can
+  Select a run to enable its actions. The **Run actions** menu groups opening
+  files and baseline comparisons; **Use Settings for New Training** and **Prepare Resume** remain
+  directly visible. Drag the horizontal divider to resize the list and details.
+- **Measure performance** enables optional five-second RAM, CPU, disk-I/O and GPU
+  sampling, displayed in Training Log and included in the run's latest recorded
+  metrics. System RAM availability helps distinguish low-memory pressure from
+  low GPU activity. CPU and disk rates cover the whole machine; GPU 0 readings
+  cover the entire board, not just training. Trainer RAM sums the trainer and its
+  descendants' resident memory; shared pages can be counted more than once and
+  inaccessible processes produce partial readings. App RAM is shown separately.
+  Missing readings are unavailable, not zero. The first CPU/disk sample is used
+  as a baseline, not a throughput result ([psutil documentation](https://psutil.readthedocs.io/stable/index.html)).
+  RAM-pressure and low-GPU hints are possibilities, not proof of a bottleneck;
+  disk throughput alone does not measure disk saturation or paging. Sampling is
+  off by default, stores no growing sample timeline, and never changes settings.
+  History can
   compare observed speed and sampled GPU memory between suitable baseline and
   candidate runs. Timing excludes the first five new steps; memory measurements
   are GPU-wide, include other applications, and can miss brief peaks.
@@ -470,6 +632,10 @@ processes; they do not require a GPU or train real models. Repeated-resume cover
 includes checkpoints at overall steps 378, 400, 450, and completion at 504, checking
 position, simulated state restoration, source preservation, and displayed progress.
 Passing these tests does not establish real model quality or GPU reproducibility.
+
+For a separate, explicitly user-started GPU check, follow the
+[real repeated-resume validation plan](docs/REPEATED_RESUME_VALIDATION.md).
+The plan uses copied data and separate output folders; it has not been executed.
 
 When reporting a problem, include the app/trainer revision, Windows/GPU details,
 reproduction steps, and relevant log excerpts. Remove private paths, captions,

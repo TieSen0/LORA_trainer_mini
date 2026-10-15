@@ -18,8 +18,11 @@ from src.dataset.validator import validate_dataset
 from src.training.command_builder import TrainingRun, create_training_run, training_environment
 from src.training.config import SDXLTrainConfig, validate_config, validate_runtime
 from src.training.monitor import TrainingMonitor, sample_gpu
+from src.training.environment import training_probe
+from src.training.resources import ResourceSampler
 from src.training.records import write_json
 from src.training.checkpoints import dataset_signature, inspect_checkpoint, list_checkpoints
+from src.training.checkpoint_monitor import CheckpointMonitor
 
 
 def stop_process_tree(process: subprocess.Popen) -> None:
@@ -46,7 +49,7 @@ def stop_process_tree(process: subprocess.Popen) -> None:
     process.wait(timeout=15)
 
 
-def run_process(command, cwd, on_output, stop_requested: threading.Event, *, env_overrides=None, on_tick=None) -> int:
+def run_process(command, cwd, on_output, stop_requested: threading.Event, *, env_overrides=None, on_tick=None, on_started=None) -> int:
     """No shell; stop remains responsive even when the child produces no output."""
     if stop_requested.is_set():
         return -1
@@ -75,6 +78,8 @@ def run_process(command, cwd, on_output, stop_requested: threading.Event, *, env
     reader.start()
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     try:
+        if on_started is not None:
+            on_started(process.pid)
         eof = False
         while not eof or process.poll() is None:
             if on_tick is not None:
@@ -132,20 +137,33 @@ class TrainingWorker(QThread):
         last_tick = last_gpu = last_record = 0.0
         gpu_peak = None
         gpu_name = None
+        checkpoint_monitor = None
+        checkpoint_status = None
+        sampler = ResourceSampler() if self.config.measure_performance and not self.export_only else None
+        resources = {} if sampler is not None else None
 
         def tick(force=False):
-            nonlocal last_tick, last_gpu, last_record, gpu_peak, gpu_name
+            nonlocal last_tick, last_gpu, last_record, gpu_peak, gpu_name, checkpoint_status, resources
             now = time.monotonic()
             if not force and now - last_tick < 1:
                 return
             last_tick = now
             if self.config.measure_performance and not self.export_only and now - last_gpu >= 5:
                 last_gpu = now
+                resources = sampler.sample(now)
                 gpu = sample_gpu()
+                resources["gpu"] = gpu
                 if gpu is not None:
                     gpu_name = gpu["name"]
                     gpu_peak = max(gpu_peak or 0, gpu["memory_mib"])
-            metrics = {**monitor.snapshot(), "peak_gpu_memory_mib": gpu_peak, "gpu_name": gpu_name}
+            if checkpoint_monitor is not None:
+                checkpoint_status = checkpoint_monitor.scan(
+                    monitor.current, monitor.total, successful_exit=record.get("status") == "success",
+                )
+                record["checkpoint_status"] = checkpoint_status
+            metrics = {**monitor.snapshot(), "peak_gpu_memory_mib": gpu_peak, "gpu_name": gpu_name,
+                       "resources": resources,
+                       "checkpoint_status": checkpoint_status}
             self.telemetry.emit(metrics)
             if run is not None and record:
                 record["metrics"] = metrics
@@ -161,6 +179,7 @@ class TrainingWorker(QThread):
                 log.write(text)
                 log.flush()
             self.output.emit(text)
+            checkpoint_finished = checkpoint_monitor.feed(text) if checkpoint_monitor is not None else False
             for step, total in monitor.feed(text):
                 self.status_changed.emit(f"Training: step {step} / {total}")
                 self.progress_changed.emit(step, total)
@@ -170,7 +189,11 @@ class TrainingWorker(QThread):
                 # trainer is later interrupted. Old logs remain a fallback.
                 record["step_layout"] = layout
                 tick(force=True)
-            self.telemetry.emit({**monitor.snapshot(), "peak_gpu_memory_mib": gpu_peak, "gpu_name": gpu_name})
+            elif checkpoint_finished:
+                tick(force=True)
+            self.telemetry.emit({**monitor.snapshot(), "peak_gpu_memory_mib": gpu_peak, "gpu_name": gpu_name,
+                                 "resources": resources,
+                                 "checkpoint_status": checkpoint_status})
 
         def check_cancelled():
             if self.stop_requested.is_set():
@@ -224,6 +247,11 @@ class TrainingWorker(QThread):
                 "message": "Run has started; an unfinished record may also indicate an interrupted app.",
             }
             write_json(run.directory / "run.json", record)
+            if not self.export_only:
+                checkpoint_monitor = CheckpointMonitor(
+                    run.directory, resume_state=self.config.resume_state,
+                    saving_enabled=self.config.save_training_state,
+                )
             self.prepared.emit(run)
             log = (run.directory / "training.log").open("w", encoding="utf-8")
             output(f"Run folder: {run.directory}\n")
@@ -245,18 +273,7 @@ class TrainingWorker(QThread):
                 monitor.phase = "Checking training environment"
                 self.status_changed.emit("Checking the training Python environment...")
                 # Check only in the user's selected runtime; no torch install in the GUI environment.
-                probe = (
-                    "import torch, accelerate, safetensors; "
-                    "print('PyTorch:', torch.__version__); "
-                    "assert torch.cuda.is_available(), 'A CUDA-capable PyTorch environment and GPU are required'; "
-                    "print('GPU:', torch.cuda.get_device_name(0)); "
-                )
-                if self.config.mixed_precision == "bf16":
-                    probe += "assert torch.cuda.is_bf16_supported(), 'Selected GPU does not support bf16'; "
-                if self.config.attention_backend == "xformers":
-                    probe += "import xformers.ops; "
-                if self.config.optimizer == "AdamW8bit":
-                    probe += "import bitsandbytes; "
+                probe = training_probe(self.config)
                 code = run_process(
                     [run.command[0], "-u", "-c", probe], run.working_directory, output, self.stop_requested,
                     env_overrides=environment,
@@ -271,6 +288,7 @@ class TrainingWorker(QThread):
                     run.command, run.working_directory, output, self.stop_requested,
                     env_overrides=environment,
                     on_tick=tick,
+                    on_started=sampler.attach if sampler is not None else None,
                 )
                 check_cancelled()
                 output("\n")  # Flush the last progress record, even without a trailing newline.

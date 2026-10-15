@@ -46,6 +46,7 @@ def training_toml(config: SDXLTrainConfig, run_dir: Path) -> str:
         "lr_scheduler": config.lr_scheduler, "max_train_epochs": config.epochs,
         "mixed_precision": config.mixed_precision,
         "cache_latents": config.cache_latents,
+        "cache_latents_to_disk": config.cache_latents_to_disk,
         "cache_text_encoder_outputs": config.cache_text_encoder_outputs,
         "gradient_checkpointing": config.gradient_checkpointing,
         "network_train_unet_only": config.network_train_unet_only,

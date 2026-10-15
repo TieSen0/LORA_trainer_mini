@@ -134,6 +134,11 @@ class ChainedResumeTests(unittest.TestCase):
             record = json.loads((result.run_directory / "run.json").read_text())
             self.assertEqual(record["metrics"]["current"], stop_at)
             self.assertEqual(record["resume_start_step"], initial)
+            checkpoint_status = record["checkpoint_status"]
+            self.assertEqual(checkpoint_status["latest"]["step"], stop_at)
+            self.assertEqual(checkpoint_status["steps_at_risk"], 0)
+            self.assertFalse(checkpoint_status["latest"]["source"])
+            self.assertEqual(checkpoint_status["latest"]["can_resume"], stop_at < 504)
             self.assertEqual(read_step_layout(result.run_directory)["steps_per_epoch"], 126)
             state = list_checkpoints(result.run_directory)[0]
             self.assertEqual(inspect_checkpoint(state)["current_step"], stop_at)
